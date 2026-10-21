@@ -19,17 +19,32 @@ const safeNumber = (value, fallback = 0) => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
-const buildDefaultProducts = () => productsData.map((product) => ({
-  ...product,
-  baseUnit: normalizeUnit(product.units?.[0] || 'piece'),
-  saleUnits: Array.from(new Set([...(product.units || []), ...(product.units || [])].map(normalizeUnit).filter(Boolean))),
-  stockBase: Number(product.stock?.split(' ')[0] || 0) || 0,
-  lowStockThreshold: 5,
-  stockStatus: 'In stock'
-}));
+const normalizeProduct = (product) => {
+  const baseUnit = normalizeUnit(product.baseUnit || product.stock?.trim().split(/\s+/).slice(1).join(' ') || product.units?.[0] || 'piece');
+  return {
+    ...product,
+    baseUnit,
+    saleUnits: product.saleUnits || Array.from(new Set([
+      baseUnit,
+      ...(baseUnit === 'goni' && product.units?.includes('half goni') ? ['half goni'] : []),
+      ...(baseUnit === 'goni' && product.units?.includes('quarter goni') ? ['quarter goni'] : [])
+    ])),
+    stockBase: Number(product.stockBase ?? product.stock?.trim().split(/\s+/)[0] ?? 0) || 0,
+    lowStockThreshold: product.lowStockThreshold ?? 5,
+    stockStatus: product.stockStatus || 'In stock'
+  };
+};
+
+const buildDefaultProducts = () => productsData.map(normalizeProduct);
 
 export default function App() {
   const [products, setProducts] = useState(buildDefaultProducts);
+  const [authReady, setAuthReady] = useState(false);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [authPassword, setAuthPassword] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [loadError, setLoadError] = useState('');
+  const [saleSubmitting, setSaleSubmitting] = useState(false);
   const [cart, setCart] = useState([]);
   const [customerName, setCustomerName] = useState('');
   const [customerPhone, setCustomerPhone] = useState('');
@@ -49,6 +64,15 @@ export default function App() {
   );
 
   useEffect(() => {
+    fetch('/api/auth/me')
+      .then(async (response) => {
+        if (!response.ok) throw new Error('Could not check admin login. Confirm the backend is running.');
+        return response.json();
+      })
+      .then((data) => setAuthenticated(data.authenticated === true))
+      .catch((error) => setAuthError(error.message))
+      .finally(() => setAuthReady(true));
+
     const savedCustomer = localStorage.getItem(STORAGE_KEYS.customerDraft);
     const savedCart = localStorage.getItem(STORAGE_KEYS.cartDraft);
     const billData = localStorage.getItem(STORAGE_KEYS.savedBillData);
@@ -83,32 +107,29 @@ export default function App() {
     }
 
     fetch('/api/products')
-      .then((res) => res.json())
-      .then((serverProducts) => {
-        if (Array.isArray(serverProducts) && serverProducts.length) {
-          setProducts(serverProducts.map((product) => ({
-            ...product,
-            baseUnit: normalizeUnit(product.units?.[0] || 'piece'),
-            saleUnits: Array.from(new Set((product.units || []).map(normalizeUnit).filter(Boolean))),
-            stockBase: Number(product.stock?.split(' ')[0] || 0) || 0,
-            lowStockThreshold: 5,
-            stockStatus: 'In stock'
-          })));
-        }
+      .then(async (res) => {
+        if (!res.ok) throw new Error('Could not load the product catalog.');
+        return res.json();
       })
-      .catch(() => {
-        // keep default product list on API failure
-      });
+      .then((serverProducts) => {
+        if (!Array.isArray(serverProducts) || !serverProducts.length) throw new Error('The product catalog is empty.');
+        setProducts(serverProducts.map(normalizeProduct));
+      })
+      .catch((error) => setLoadError(error.message));
+  }, []);
 
+  useEffect(() => {
+    if (!authReady || !authenticated) return;
     fetch('/api/sales')
-      .then((res) => res.json())
+      .then(async (res) => {
+        if (!res.ok) throw new Error('Could not load sales history.');
+        return res.json();
+      })
       .then((data) => {
         if (Array.isArray(data)) setSalesHistory(data);
       })
-      .catch(() => {
-        // ignore sales API failure
-      });
-  }, []);
+      .catch((error) => setLoadError(error.message));
+  }, [authReady, authenticated]);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.customerDraft, JSON.stringify({ name: customerName, phone: customerPhone }));
@@ -130,7 +151,7 @@ export default function App() {
         .toLowerCase();
       const matchesSearch = !lowerSearch || haystack.includes(lowerSearch);
       const matchesCategory = category === 'all' || product.category === category;
-      const matchesUnit = unitFilter === 'all' || (product.units || []).includes(unitFilter);
+      const matchesUnit = unitFilter === 'all' || (product.saleUnits || []).includes(unitFilter);
       return matchesSearch && matchesCategory && matchesUnit;
     });
   }, [products, search, category, unitFilter]);
@@ -151,7 +172,12 @@ export default function App() {
     return { itemsCount, totalQty, totalAmount: money(totalAmount) };
   }, [cart]);
 
-  const addToCart = (product, selectedUnit = product.units?.[0] || 'piece') => {
+  const addToCart = (product, selectedUnit = product.saleUnits?.[0] || 'piece') => {
+    if (!(product.saleUnits || []).includes(normalizeUnit(selectedUnit))) {
+      showToast(`No verified stock conversion is configured for ${selectedUnit}.`, true);
+      return;
+    }
+    const unitRate = money(product.price * (product.conversions?.[selectedUnit] || 1));
     const currentLine = cart.find((item) => item.id === product.id && item.unit === selectedUnit);
     const nextQty = currentLine ? Number(currentLine.qty || 0) + 1 : 1;
     const nextItem = {
@@ -160,12 +186,12 @@ export default function App() {
       brand: product.brands?.[0] || 'Standard',
       unit: selectedUnit,
       qty: nextQty,
-      price: product.price,
-      amount: money(product.price * nextQty)
+      price: unitRate,
+      amount: money(unitRate * nextQty)
     };
 
     if (currentLine) {
-      setCart((prev) => prev.map((item) => (item.id === product.id && item.unit === selectedUnit ? { ...item, qty: nextQty, amount: money(product.price * nextQty) } : item)));
+      setCart((prev) => prev.map((item) => (item.id === product.id && item.unit === selectedUnit ? { ...item, qty: nextQty, amount: money(unitRate * nextQty) } : item)));
     } else {
       setCart((prev) => [...prev, nextItem]);
     }
@@ -226,6 +252,7 @@ export default function App() {
   };
 
   const completeSale = async () => {
+    if (saleSubmitting) return;
     if (!cart.length) {
       showToast('Cart is empty. Add at least one product before completing a sale.', true);
       return;
@@ -233,41 +260,52 @@ export default function App() {
 
     const invoiceDoc = buildInvoiceDocument(true);
     const payload = {
-      invoiceNumber: invoiceDoc.invoiceNumber,
-      generatedAt: invoiceDoc.generatedAt,
       customerName: invoiceDoc.customerName,
       customerPhone: invoiceDoc.customerPhone,
-      items: invoiceDoc.items,
-      subtotal: invoiceDoc.subtotal,
-      totalQty: invoiceDoc.totalQty,
-      grandTotal: invoiceDoc.grandTotal,
-      completed: true,
-      shopName: invoiceDoc.shopName,
-      shopAddress: invoiceDoc.shopAddress,
-      shopPhone: invoiceDoc.shopPhone
+      items: cart.map((item) => ({
+        productId: item.id,
+        unit: item.unit,
+        quantity: item.qty,
+        rate: item.price
+      }))
     };
 
+    setSaleSubmitting(true);
     try {
       const response = await fetch('/api/sales', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
+      const responseBody = await response.json();
       if (!response.ok) {
-        throw new Error('Unable to save sale');
+        if (response.status === 401) setAuthenticated(false);
+        throw new Error(responseBody.error || 'Unable to complete the sale.');
       }
-      const savedSale = await response.json();
+      const savedSale = responseBody;
       setSalesHistory((prev) => [savedSale, ...prev]);
       setLastCompletedInvoice(savedSale);
-      setInvoicePreview({ ...invoiceDoc, completed: true, invoiceNumber: savedSale.invoiceNumber || invoiceDoc.invoiceNumber });
+      setInvoicePreview(savedSale);
       setCart([]);
       setCustomerName('');
       setCustomerPhone('');
       localStorage.removeItem(STORAGE_KEYS.cartDraft);
       showToast('Sale completed and saved successfully.');
+      fetch('/api/products')
+        .then((res) => {
+          if (!res.ok) throw new Error('Sale saved, but refreshed stock could not be loaded.');
+          return res.json();
+        })
+        .then((data) => setProducts(data.map(normalizeProduct)))
+        .catch((error) => {
+          setLoadError(error.message);
+          showToast(error.message, true);
+        });
     } catch (error) {
       console.error(error);
-      showToast('Unable to save the invoice. Please try again.', true);
+      showToast(error.message || 'Unable to save the invoice. Please try again.', true);
+    } finally {
+      setSaleSubmitting(false);
     }
   };
 
@@ -327,6 +365,81 @@ export default function App() {
     }
   };
 
+  const handleLogin = async (event) => {
+    event.preventDefault();
+    setAuthError('');
+    try {
+      const response = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: authPassword })
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Login failed.');
+      setAuthPassword('');
+      setAuthenticated(true);
+    } catch (error) {
+      setAuthError(error.message || 'Unable to log in. Confirm the backend is running.');
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      const response = await fetch('/api/auth/logout', { method: 'POST' });
+      if (!response.ok) throw new Error('Could not log out.');
+      setAuthenticated(false);
+      setSalesHistory([]);
+    } catch (error) {
+      showToast(error.message, true);
+    }
+  };
+
+  const refreshInventory = async () => {
+    try {
+      const response = await fetch('/api/products');
+      const data = await response.json();
+      if (!response.ok || !Array.isArray(data)) {
+        throw new Error(data.error || 'Could not refresh inventory.');
+      }
+      setProducts(data.map(normalizeProduct));
+      setLoadError('');
+    } catch (error) {
+      setLoadError(error.message || 'Could not refresh inventory.');
+    }
+  };
+
+  if (!authReady) {
+    return <div className="auth-screen"><section className="panel auth-panel">Checking admin access…</section></div>;
+  }
+
+  if (!authenticated) {
+    return (
+      <div className="auth-screen">
+        <section className="panel auth-panel">
+          <div className="section-title">
+            <small>Admin access</small>
+            <h1>Chaurasiya Puja Samagri</h1>
+          </div>
+          <p>Sign in to manage billing and view sales history.</p>
+          {authError && <p className="auth-error" role="alert">{authError}</p>}
+          <form className="auth-form" onSubmit={handleLogin}>
+            <label htmlFor="adminPassword">Admin password</label>
+            <input
+              className="input"
+              id="adminPassword"
+              type="password"
+              autoComplete="current-password"
+              value={authPassword}
+              onChange={(event) => setAuthPassword(event.target.value)}
+              required
+            />
+            <button className="action-btn primary" type="submit">Sign in</button>
+          </form>
+        </section>
+      </div>
+    );
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -348,8 +461,11 @@ export default function App() {
           <div><strong>Phone:</strong> 9516733895</div>
           <div><strong>Categories:</strong> Puja Essentials • Dry Fruits / Grocery • Oils / Kapoor / Agarbatti</div>
           <div><strong>Abhi ka time:</strong> {new Date().toLocaleString('en-IN')}</div>
+          <button className="ghost-btn" onClick={handleLogout}>Log out</button>
         </div>
       </header>
+
+      {loadError && <div className="cart-validation error" role="alert">{loadError}</div>}
 
       <main className="main-grid">
         <section className="panel">
@@ -379,7 +495,7 @@ export default function App() {
               <label htmlFor="unitQuickFilter">Unit help</label>
               <select className="select" id="unitQuickFilter" value={unitFilter} onChange={(e) => setUnitFilter(e.target.value)}>
                 <option value="all">Sab units</option>
-                {['goni', 'half goni', 'quarter goni', 'kg', 'gram', 'packet', 'piece', 'box'].map((unit) => (
+                {[...new Set(products.flatMap((product) => product.saleUnits || []))].map((unit) => (
                   <option key={unit} value={unit}>{unit}</option>
                 ))}
               </select>
@@ -399,7 +515,7 @@ export default function App() {
                   <p className="price-row">₹{formatCurrency(product.price)}</p>
                   <p className="muted">Stock: {product.stock || 'N/A'}</p>
                   <div className="product-actions">
-                    {product.units?.map((unit) => (
+                    {product.saleUnits?.map((unit) => (
                       <button key={unit} className="mini-btn" onClick={() => addToCart(product, unit)}>
                         Add {unit}
                       </button>
@@ -469,7 +585,9 @@ export default function App() {
 
           <div className="actions">
             <button className="action-btn primary" onClick={generateBillPreview}>Generate Bill</button>
-            <button className="action-btn green" onClick={completeSale}>Complete Sale</button>
+            <button className="action-btn green" onClick={completeSale} disabled={saleSubmitting}>
+              {saleSubmitting ? 'Saving sale…' : 'Complete Sale'}
+            </button>
             <button className="action-btn blue" onClick={saveCurrentData}>Save Data</button>
             <button className="action-btn purple" onClick={printInvoice}>Print</button>
             <button className="action-btn green" onClick={printInvoice}>PDF</button>
@@ -489,7 +607,7 @@ export default function App() {
             <small>Inventory Manager</small>
             <h2>Stock Ledger</h2>
           </div>
-          <button className="ghost-btn" onClick={() => setProducts(buildDefaultProducts())}>Refresh</button>
+          <button className="ghost-btn" onClick={refreshInventory}>Refresh</button>
         </div>
 
         <div className="inventory-controls">
@@ -525,12 +643,12 @@ export default function App() {
                 <tr key={product.id}>
                   <td>{product.name}</td>
                   <td>{product.category}</td>
-                  <td>{product.stock || '0 piece'}</td>
-                  <td>{product.stock || '0 piece'}</td>
-                  <td>0</td>
-                  <td>{product.stockStatus || 'In stock'}</td>
-                  <td>{(product.units || []).join(', ')}</td>
-                  <td><button className="ghost-btn small" onClick={() => addToCart(product, product.units?.[0] || 'piece')}>Quick Add</button></td>
+                  <td>{product.openingStockBase ?? product.stockBase} {product.baseUnit}</td>
+                  <td>{product.stockBase} {product.baseUnit}</td>
+                  <td>{Math.max(0, (product.openingStockBase ?? product.stockBase) - product.stockBase)} {product.baseUnit}</td>
+                  <td>{product.stockBase <= 0 ? 'Out of stock' : product.stockBase <= product.lowStockThreshold ? 'Low stock' : 'In stock'}</td>
+                  <td>{(product.saleUnits || []).join(', ')}</td>
+                  <td><button className="ghost-btn small" onClick={() => addToCart(product, product.saleUnits?.[0] || 'piece')}>Quick Add</button></td>
                 </tr>
               ))}
             </tbody>

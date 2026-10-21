@@ -4,3 +4,9 @@ dist
 .DS_Store
 npm-debug.log*
 backend/data/sales.json
+.env
+.env.*
+!.env.example
+backend/data/*.sqlite
+backend/data/*.sqlite-shm
+backend/data/*.sqlite-wal
